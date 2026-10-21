@@ -1,0 +1,11 @@
+[Unit]
+Description=Cloudflare tunnel moon-asr (asr.daoan.online -> localhost:8000)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file %h/.cloudflared/moon-asr.token
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

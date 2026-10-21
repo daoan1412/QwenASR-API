@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+# API key và log cũ có chứa key
+.api_key
+server.log
+# kết quả job (giữ 24 h)
+jobs/
+*.tmp
