@@ -110,7 +110,13 @@ def load_audio(url, max_seconds=0, workers=16, group=60, progress=None, ahead=2)
                 if j not in futs:
                     futs[j] = [ex.submit(get, s[2]) for s in groups[j]]
             g = groups[k]
-            wav = decode_audio(b"".join(f.result() for f in futs.pop(k)))
+            try:
+                data = b"".join(f.result() for f in futs.pop(k))
+            except urllib.error.HTTPError as e:   # đoạn .ts đã bị gỡ: coi như không có video (thêm cho server)
+                if e.code in NO_VIDEO_HTTP:
+                    raise NoVideo(f"HTTP {e.code} {e.url}") from None
+                raise
+            wav = decode_audio(data)
             has_audio |= wav is not None
             parts.append(fit(wav if wav is not None else np.zeros(0, np.float32), sum(s[1] for s in g)))
             if progress:

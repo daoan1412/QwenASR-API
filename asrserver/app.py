@@ -193,8 +193,9 @@ class Server:
         log.info("nạp %d job (%d chờ)", len(self.jobs), len(self.queued))
 
     def submit(self, body: JobIn, key: str | None):
-        if key and (old := self.jobs.get(self.idem.get(key, ""))) and old.status not in ("failed", "cancelled"):
-            return old
+        if key and (old := self.jobs.get(self.idem.get(key, ""))) and old.status not in ("failed", "cancelled") \
+                and (old.result or {}).get("status") != "no_video":
+            return old   # no_video có thể là video đang chuyển mã, nên gửi lại thì tải lại
         if len(self.queued) >= MAX_QUEUE:
             raise HTTPException(429, "hàng đợi đầy", headers={"Retry-After": "60"})
         self.seq += 1
