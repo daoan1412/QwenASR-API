@@ -54,8 +54,9 @@ curl https://asr.daoan.online/v1/asr/jobs \
 
 Hành vi chính:
 - `priority`: `high`, `normal` hoặc `low`. Job `high` được thêm 4 slot chạy riêng.
-- `Idempotency-Key` trùng thì trả job cũ. Nếu job cũ đã `failed` hoặc `cancelled`, server tạo job mới.
-- Link trả 403, 404, 410 hoặc HLS rỗng thì job vẫn `succeeded`, với `result.status = "no_video"`.
+- `Idempotency-Key` trùng thì trả job cũ. Nếu job cũ là `no_video`, `failed` hoặc `cancelled`, server tạo job mới.
+- Playlist hoặc một đoạn `.ts` trả 403, 404, 410, hay HLS rỗng, thì job vẫn `succeeded`, với `result.status = "no_video"`.
+  Server không thử lại các mã này.
 - Lỗi mạng, OOM hay engine chết có `retryable: true`. Lỗi giải mã có `retryable: false`.
 - Kết quả giữ 24 giờ trong `jobs/`. Job đang chờ được chạy lại khi server khởi động lại.
 - Nếu có `callback_url`, server POST kết quả tới đó khi job kết thúc. Server thử lại tối đa 4 lần.
