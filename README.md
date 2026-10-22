@@ -76,7 +76,7 @@ Hành vi chính:
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `ASR_GPU_UTIL` | `0.45` | Phần VRAM vLLM giữ. Encoder dùng thêm khoảng 3 GB ngoài phần này. |
-| `ASR_MAX_ACTIVE` | `6` | Số job tải và chép cùng lúc |
+| `ASR_MAX_ACTIVE` | `12` | Số job tải và chép cùng lúc. 6 thì mạng còn trống. |
 | `ASR_HIGH_EXTRA` | `4` | Slot thêm cho job `high` |
 | `ASR_MAX_QUEUE` | `2000` | Quá số này thì trả `429` |
 | `ASR_LANG_LOCK` | `1` | `0` thì tắt khoá ngôn ngữ, version thành `v2-nolock` |

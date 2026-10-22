@@ -34,7 +34,7 @@ MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 HOST = os.environ.get("ASR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ASR_PORT", "8000"))
 GPU_UTIL = float(os.environ.get("ASR_GPU_UTIL", "0.45"))
-MAX_ACTIVE = int(os.environ.get("ASR_MAX_ACTIVE", "6"))     # job tải/chép cùng lúc
+MAX_ACTIVE = int(os.environ.get("ASR_MAX_ACTIVE", "12"))     # job tải/chép cùng lúc
 HIGH_EXTRA = int(os.environ.get("ASR_HIGH_EXTRA", "4"))     # slot thêm chỉ cho job high
 MAX_QUEUE = int(os.environ.get("ASR_MAX_QUEUE", "2000"))    # quá thì 429
 LANG_LOCK = os.environ.get("ASR_LANG_LOCK", "1") == "1"
