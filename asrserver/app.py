@@ -4,6 +4,7 @@ Chạy: python -m asrserver.app  (cwd = Projects/qwen3-asr). Biến môi trườ
 """
 import asyncio
 import concurrent.futures
+import gc
 import http.client
 import json
 import logging
@@ -327,6 +328,7 @@ class Server:
             job.error = {"code": code, "message": msg, "retryable": retry}
             job.finish("failed")
             log.warning("lỗi %s ref=%s %s %s", job.job_id, job.ref, code, msg)
+            gc.collect()   # lỗi giữa lúc tải để lại vòng tham chiếu future → exception → socket
             fatal = isinstance(e, EngineDeadError)
         finally:
             self.running.discard(job.job_id)

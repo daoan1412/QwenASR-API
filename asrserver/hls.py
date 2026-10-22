@@ -26,6 +26,7 @@ def get(url, timeout=60, tries=3):
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
+            e.close()   # HTTPError giữ socket; nằm trong vòng tham chiếu nên chỉ gc.collect() mới đóng
             if e.code < 500 or k == tries - 1:
                 raise
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):

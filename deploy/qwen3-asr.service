@@ -5,6 +5,7 @@ Description=Qwen3-ASR-1.7B vLLM server (127.0.0.1:8000)
 ExecStart=/media/daoan/Data/Projects/qwen3-asr/run.sh
 Restart=on-failure
 RestartSec=10
+LimitNOFILE=65536
 
 [Install]
 WantedBy=default.target
