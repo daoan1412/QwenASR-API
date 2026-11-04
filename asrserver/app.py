@@ -1,14 +1,17 @@
-"""Server chép lời video HLS theo job bất đồng bộ, kết quả khớp ml.VideoTranscript v2.
+"""Server ASR dùng chung theo job bất đồng bộ: chép lời video HLS (kết quả khớp ml.VideoTranscript v2), tệp upload hoặc
+link tệp tiếng/video; chế độ cues (câu phụ đề, mặc định) | text (chỉ chữ) | align (mốc từng từ, Qwen3-ForcedAligner).
 
-Chạy: python -m asrserver.app  (cwd = Projects/qwen3-asr). Biến môi trường: xem phần CẤU HÌNH.
+Chạy: python -m asrserver.app  (cwd = thư mục repo). Biến môi trường: xem phần CẤU HÌNH.
 """
 import asyncio
 import concurrent.futures
 import gc
+import hashlib
 import http.client
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import threading
@@ -21,26 +24,47 @@ from pathlib import Path
 from typing import Literal
 
 import av
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from . import cues, edge_dns, hls, pipeline
+from . import aligner, asr, cues, edge_dns, hls, media, pipeline
+from .asr import SR
 
 # ---------- CẤU HÌNH ----------
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
-HOST = os.environ.get("ASR_HOST", "127.0.0.1")
+HOSTS = [h.strip() for h in os.environ.get("ASR_HOST", "127.0.0.1").split(",") if h.strip()]  # vd. "127.0.0.1,172.17.0.1"
 PORT = int(os.environ.get("ASR_PORT", "8000"))
 GPU_UTIL = float(os.environ.get("ASR_GPU_UTIL", "0.45"))
 MAX_ACTIVE = int(os.environ.get("ASR_MAX_ACTIVE", "12"))     # job tải/chép cùng lúc
 HIGH_EXTRA = int(os.environ.get("ASR_HIGH_EXTRA", "4"))     # slot thêm chỉ cho job high
 MAX_QUEUE = int(os.environ.get("ASR_MAX_QUEUE", "2000"))    # quá thì 429
 LANG_LOCK = os.environ.get("ASR_LANG_LOCK", "1") == "1"
-JOBS_DIR = ROOT / "jobs"
+KEY_MAX_QUEUE = int(os.environ.get("ASR_KEY_MAX_QUEUE", "200"))  # job chờ tối đa của mỗi khoá phụ (.api_keys)
+ALIGN_PRELOAD = os.environ.get("ASR_ALIGN_PRELOAD", "1") == "1"
+KEYS_DIR = Path(os.environ.get("ASR_KEYS_DIR", ROOT))   # chứa .api_key (+ .api_keys); test đặt thư mục tạm
+JOBS_DIR = Path(os.environ.get("ASR_JOBS_DIR", ROOT / "jobs"))
+UPLOADS = JOBS_DIR / "uploads"
 KEEP = timedelta(hours=24)
-API_KEY = (ROOT / ".api_key").read_text().strip()
+UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def load_keys():
+    """{khoá: tên}: .api_key là "main" (không giới hạn); .api_keys thêm khoá phụ, mỗi dòng "tên khoá" (vd. sandbox Xưởng
+    video) — job chờ của mỗi khoá phụ tối đa ASR_KEY_MAX_QUEUE."""
+    keys = {(KEYS_DIR / ".api_key").read_text().strip(): "main"}
+    extra = KEYS_DIR / ".api_keys"
+    if extra.exists():
+        for ln in extra.read_text().splitlines():
+            if ln.strip() and not ln.lstrip().startswith("#"):
+                name, key = ln.split()
+                keys[key] = name
+    return keys
+
+
+KEYS = load_keys()
 VERSION = pipeline.VERSION if LANG_LOCK else f"{pipeline.VERSION}-nolock"
 PRIORITY = {"high": 0, "normal": 1, "low": 2}
 FINISHED = ("succeeded", "failed", "cancelled")
@@ -77,12 +101,26 @@ class Options(BaseModel):
 
 class JobIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    audio_url: str
+    audio_url: str | None = None     # link HLS (như cũ) hoặc link tệp tiếng/video
+    upload_id: str | None = None     # tệp đã gửi qua POST /v1/uploads
+    mode: Literal["cues", "text", "align"] = "cues"
+    text: str | None = None          # align: lời đã biết (vd. chữ TTS đọc)
+    language: str | None = None      # text: ép ngôn ngữ (như qwen_asr language=…); align: mặc định Vietnamese
     ref: str | int | None = None
     max_seconds: float = Field(0, ge=0)
     priority: Literal["high", "normal", "low"] = "normal"
     options: Options = Options()
     callback_url: str | None = None
+
+    @model_validator(mode="after")
+    def check(self):
+        if (self.audio_url is None) == (self.upload_id is None):
+            raise ValueError("cần đúng một trong audio_url / upload_id")
+        if self.upload_id is not None and not UPLOAD_ID.fullmatch(self.upload_id):
+            raise ValueError("upload_id sai dạng")
+        if self.mode == "align" and not (self.text or "").strip():
+            raise ValueError("mode align cần text")
+        return self
 
 
 # ---------- LỖI ----------
@@ -95,6 +133,10 @@ def classify(e):
     from vllm.v1.engine.exceptions import EngineDeadError
 
     msg = f"{type(e).__name__}: {e}"[:500]
+    if isinstance(e, media.NotMedia):
+        return "not_media", msg, False
+    if isinstance(e, ValueError) and str(e).startswith(("align:", "upload")):
+        return "bad_input", msg, False
     if isinstance(e, urllib.error.HTTPError):
         return "download_error", f"HTTP {e.code} {e.url}", e.code >= 500 or e.code in (408, 429)
     if isinstance(e, (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException)):
@@ -112,7 +154,8 @@ def classify(e):
 
 # ---------- JOB ----------
 class Job:
-    FIELDS = ("job_id", "ref", "status", "audio_url", "max_seconds", "priority", "options", "callback_url",
+    FIELDS = ("job_id", "ref", "status", "audio_url", "upload_id", "mode", "text", "language", "key_name",
+              "max_seconds", "priority", "options", "callback_url",
               "idempotency_key", "seq", "created_at", "started_at", "finished_at", "expires_at",
               "result", "timing", "error")
 
@@ -192,14 +235,22 @@ class Server:
                 self.idem[job.idempotency_key] = job.job_id
         log.info("nạp %d job (%d chờ)", len(self.jobs), len(self.queued))
 
-    def submit(self, body: JobIn, key: str | None):
+    def submit(self, body: JobIn, key: str | None, key_name: str = "main"):
         if key and (old := self.jobs.get(self.idem.get(key, ""))) and old.status not in ("failed", "cancelled") \
                 and (old.result or {}).get("status") != "no_video":
             return old   # no_video có thể là video đang chuyển mã, nên gửi lại thì tải lại
         if len(self.queued) >= MAX_QUEUE:
             raise HTTPException(429, "hàng đợi đầy", headers={"Retry-After": "60"})
+        if key_name != "main" and sum(self.jobs[j].key_name == key_name for j in self.queued) >= KEY_MAX_QUEUE:
+            raise HTTPException(429, f"khoá {key_name}: quá {KEY_MAX_QUEUE} job chờ", headers={"Retry-After": "30"})
+        if body.upload_id:
+            p = UPLOADS / body.upload_id
+            if not p.exists():
+                raise HTTPException(404, "không có upload_id (hết hạn 24 h hoặc chưa gửi)")
+            os.utime(p)
         self.seq += 1
         job = Job(job_id=f"asr_{secrets.token_hex(8)}", ref=body.ref, status="queued", audio_url=body.audio_url,
+                  upload_id=body.upload_id, mode=body.mode, text=body.text, language=body.language, key_name=key_name,
                   max_seconds=body.max_seconds, priority=body.priority, options=body.options.model_dump(),
                   callback_url=body.callback_url, idempotency_key=key, seq=self.seq, created_at=iso(now()))
         job.save()
@@ -242,11 +293,16 @@ class Server:
                     if self.idem.get(job.idempotency_key) == jid:
                         del self.idem[job.idempotency_key]
                     (JOBS_DIR / f"{jid}.json").unlink(missing_ok=True)
+            # tệp upload: giữ KEEP kể từ lần dùng cuối (tạo job / job xong), job còn chờ/chạy thì giữ
+            busy = {self.jobs[j].upload_id for j in self.queued | self.running}
+            for p in UPLOADS.glob("*"):
+                if p.name not in busy and now() - datetime.fromtimestamp(p.stat().st_mtime, timezone.utc) > KEEP:
+                    p.unlink(missing_ok=True)
 
-    async def chunks(self, job, clips, lang_ids, tps, prio):
+    async def chunks(self, job, clips, lang_ids, tps, prio, force_language=None):
         """Gửi mọi khúc một lượt cùng lúc vào vLLM; huỷ job → huỷ các request còn lại."""
         async def one(c):
-            r = await self.engine.one(c, lang_ids, tps, prio)
+            r = await self.engine.one(c, lang_ids, tps, prio, force_language)
             job.progress["done"] += 1
             job.progress["percent"] = int(100 * job.progress["done"] / job.progress["total"])
             return r
@@ -261,7 +317,7 @@ class Server:
         finally:
             job.tasks = []
 
-    def transcriber(self, job, cfg, prio):
+    def transcriber(self, job, cfg, prio, force_language=None):
         """Hàm đồng bộ cho pipeline.transcribe (chạy trong luồng job), gọi sang event loop."""
         lang_ids = self.engine.lang_ids(cfg["languages"])
         passes = iter(["pass1", "pass2"])
@@ -271,7 +327,7 @@ class Server:
                 raise Cancelled
             job.progress = {"stage": next(passes, "pass2"), "done": 0, "total": len(clips), "percent": 0}
             fut = asyncio.run_coroutine_threadsafe(
-                self.chunks(job, clips, lang_ids, cfg["tokens_per_second"], prio), self.loop)
+                self.chunks(job, clips, lang_ids, cfg["tokens_per_second"], prio, force_language), self.loop)
             try:
                 return fut.result()
             except (concurrent.futures.CancelledError, asyncio.CancelledError):
@@ -290,13 +346,25 @@ class Server:
 
         t0 = time.monotonic()
         job.progress = {"stage": "download", "done": 0, "total": 0, "percent": 0}
+        mode = job.mode or "cues"
         try:
-            audio = hls.load_audio(job.audio_url, job.max_seconds, progress=dl_progress)
+            if job.upload_id:
+                p = UPLOADS / job.upload_id
+                if not p.exists():
+                    raise ValueError("upload đã hết hạn / bị xoá")
+                audio = media.decode(str(p), job.max_seconds)
+            else:
+                audio = media.load_url(job.audio_url, job.max_seconds, progress=dl_progress)
         except hls.NoVideo as e:
             return {"status": "no_video", "reason": str(e), "duration_sec": None, "transcribed_sec": None,
                     "playlist": None, "language": ",,", "cues": [], "vtt": None,
                     "model": MODEL, "version": VERSION}, {"download_sec": round(time.monotonic() - t0, 2)}
         t1 = time.monotonic()
+        if mode != "cues":
+            result = self.work_text(job, audio, cfg) if mode == "text" else self.work_align(job, audio)
+            t2 = time.monotonic()
+            return result, {"download_sec": round(t1 - t0, 2), "asr_sec": round(t2 - t1, 2),
+                            "processing_sec": round(t2 - t0, 2)}
         status, out = pipeline.transcribe(audio, self.transcriber(job, cfg, PRIORITY[job.priority]), cfg)
         job.progress = {"stage": "cues", "done": 0, "total": 1, "percent": 99}
         result = {"status": status, "reason": None, "duration_sec": audio.duration,
@@ -308,6 +376,34 @@ class Server:
         return result, {"download_sec": round(t1 - t0, 2), "asr_sec": round(t2 - t1, 2),
                         "processing_sec": round(t2 - t0, 2),
                         "rtf": round((t2 - t0) / audio.seconds, 4) if audio.seconds else None}
+
+    def work_text(self, job, audio, cfg):
+        """Chỉ chữ (vd. soát giọng TTS): một lượt khúc ~window_s giây cắt ở chỗ nhỏ tiếng, bỏ khúc lặng, nối chữ."""
+        base = {"reason": None, "duration_sec": audio.duration, "transcribed_sec": audio.seconds,
+                "playlist": audio.playlist, "model": MODEL, "version": VERSION}
+        if audio.wav is None:
+            return {"status": "no_audio", "text": "", "language": ",,", **base}
+        wav = audio.wav
+        rms = asr.frame_rms(wav)
+        thr = asr.threshold(rms)
+        wins = [(s, e) for s, e in asr.cut(rms, len(wav) / SR, cfg["window_s"], cfg["window_slack_s"])
+                if asr.voiced_span(rms, s, e, thr, cfg["min_voiced_s"])]
+        if not wins:
+            return {"status": "silent", "text": "", "language": ",,", **base}
+        out = self.transcriber(job, cfg, PRIORITY[job.priority], job.language)(
+            [wav[int(s * SR):int(e * SR)] for s, e in wins])
+        text = " ".join(t for _, t in out if t)
+        lang = cues.languages([{"lang": cues.lang_code(l)} for l, t in out if t])
+        return {"status": "ok" if text else "silent", "text": text, "language": lang, **base}
+
+    def work_align(self, job, audio):
+        base = {"reason": None, "duration_sec": audio.duration, "transcribed_sec": audio.seconds,
+                "playlist": audio.playlist, "model": aligner.MODEL, "version": VERSION}
+        if audio.wav is None:
+            return {"status": "no_audio", "words": [], **base}
+        job.progress = {"stage": "align", "done": 0, "total": 1, "percent": 50}
+        path = str(UPLOADS / job.upload_id) if job.upload_id else None
+        return {"status": "ok", "words": ALIGNER.align(audio.wav, job.text, job.language or "Vietnamese", path), **base}
 
     async def run(self, job):
         job.status, job.started_at = "running", iso(now())
@@ -334,6 +430,8 @@ class Server:
         finally:
             self.running.discard(job.job_id)
             self.wake.set()
+            if job.upload_id and (UPLOADS / job.upload_id).exists():
+                os.utime(UPLOADS / job.upload_id)
         if job.callback_url:
             POOL.submit(callback, job.callback_url, self.view(job))
         if fatal:   # engine chết → thoát để systemd khởi động lại
@@ -357,6 +455,7 @@ def callback(url, body):
 
 # ---------- HTTP ----------
 S = Server()
+ALIGNER = aligner.Aligner()
 
 
 @asynccontextmanager
@@ -367,11 +466,15 @@ async def lifespan(app):
     if os.environ.get("ASR_CDN_DNS"):   # tắt mặc định: edge VN đo không nhanh hơn (xem edge_dns.py)
         log.info("edge CDN lessonvid: %s", edge_dns.install())
     S.load()
+    UPLOADS.mkdir(parents=True, exist_ok=True)
     S.engine = Engine(MODEL, gpu_memory_utilization=GPU_UTIL, lang_lock=LANG_LOCK)
     await S.engine.warmup()
+    if ALIGN_PRELOAD:   # nạp aligner nền: job align đầu tiên khỏi chờ ~10 s, lỗi GPU thấy ngay trong log
+        POOL.submit(lambda: (ALIGNER.load(), log.info("aligner sẵn sàng: %s %s", aligner.MODEL, aligner.DEVICE)))
     tasks = [asyncio.create_task(S.dispatch()), asyncio.create_task(S.cleanup())]
     S.wake.set()
-    log.info("sẵn sàng: %s %s, %d job song song", MODEL, VERSION, MAX_ACTIVE)
+    log.info("sẵn sàng: %s %s, %d job song song, %d khoá, nghe %s:%d", MODEL, VERSION, MAX_ACTIVE, len(KEYS),
+             ",".join(HOSTS), PORT)
     yield
     for t in tasks:
         t.cancel()
@@ -386,10 +489,13 @@ async def bad_body(request, exc):
                         status_code=400)
 
 
-def auth(authorization: str | None = Header(None), x_api_key: str | None = Header(None)):
+def auth(authorization: str | None = Header(None), x_api_key: str | None = Header(None)) -> str:
+    """→ tên khoá ("main" hoặc tên trong .api_keys)."""
     key = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
-    if not key or not secrets.compare_digest(key, API_KEY):
-        raise HTTPException(401, "thiếu hoặc sai API key", headers={"WWW-Authenticate": "Bearer"})
+    for k, name in KEYS.items():
+        if key and secrets.compare_digest(key, k):
+            return name
+    raise HTTPException(401, "thiếu hoặc sai API key", headers={"WWW-Authenticate": "Bearer"})
 
 
 def get_job(job_id):
@@ -404,22 +510,58 @@ async def health():
     return {"status": "ok", "queue": len(S.queued), "running": len(S.running), "model": MODEL, "version": VERSION}
 
 
-@app.post("/v1/asr/jobs", status_code=202, dependencies=[Depends(auth)])
-async def create(body: JobIn, idempotency_key: str | None = Header(None)):
+@app.post("/v1/uploads", status_code=201)
+async def upload(request: Request, key_name: str = Depends(auth)):
+    """Thân request là nguyên tệp tiếng/video (wav, mp3, mp4…) → {upload_id, bytes}; dùng trong job ≤ 24 h kể từ lần dùng
+    cuối. Cùng nội dung → cùng upload_id (sha256)."""
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    h, n = hashlib.sha256(), 0
+    tmp = UPLOADS / f".{secrets.token_hex(8)}.part"
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                n += len(chunk)
+                if n > media.MAX_BYTES:
+                    raise HTTPException(413, f"tệp lớn hơn {media.MAX_BYTES >> 20} MB")
+                h.update(chunk)
+                f.write(chunk)
+        if n == 0:
+            raise HTTPException(400, "thân request rỗng")
+        uid = h.hexdigest()[:32]
+        dst = UPLOADS / uid
+        if dst.exists():
+            os.utime(dst)
+        else:
+            tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    log.info("upload %s %d byte (khoá %s)", uid, n, key_name)
+    return {"upload_id": uid, "bytes": n}
+
+
+@app.post("/v1/asr/jobs", status_code=202)
+async def create(body: JobIn, idempotency_key: str | None = Header(None), key_name: str = Depends(auth)):
     try:
         S.engine.lang_ids(body.options.languages)
+        if body.language:
+            S.engine.lang_ids([body.language])
     except ValueError as e:
         raise HTTPException(400, str(e))
     if body.callback_url and not body.callback_url.startswith(("http://", "https://")):
         raise HTTPException(400, "callback_url phải là http(s)")
-    job = S.submit(body, idempotency_key)
+    job = S.submit(body, idempotency_key, key_name)
     return {k: v for k, v in S.view(job).items() if k in
             ("job_id", "ref", "status", "queue_position", "created_at", "poll_url")}
 
 
 @app.get("/v1/asr/jobs/{job_id}", dependencies=[Depends(auth)])
-async def status(job_id: str):
-    return S.view(get_job(job_id))
+async def status(job_id: str, wait: float = Query(0, ge=0, le=60)):
+    """wait > 0: giữ request tới khi job xong hoặc hết bấy nhiêu giây (client khúc ngắn khỏi hỏi đi hỏi lại)."""
+    job = get_job(job_id)
+    end = time.monotonic() + wait
+    while job.status not in FINISHED and time.monotonic() < end:
+        await asyncio.sleep(0.2)
+    return S.view(job)
 
 
 @app.delete("/v1/asr/jobs/{job_id}", dependencies=[Depends(auth)])
@@ -445,4 +587,10 @@ if __name__ == "__main__":
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    socks = []
+    for h in HOSTS:   # nhiều địa chỉ: 127.0.0.1 cho máy này + 172.17.0.1 (docker0) cho container/sandbox
+        sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sk.bind((h, PORT))
+        socks.append(sk)
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=socks)

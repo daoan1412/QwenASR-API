@@ -1,8 +1,21 @@
 # Qwen3-ASR job server
 
-Server chép lời video HLS bằng Qwen3-ASR-1.7B.
-Kết quả khớp `ml.VideoTranscript` bản v2 của moon-ml.
-Địa chỉ public: https://asr.daoan.online.
+Server ASR dùng chung: Qwen3-ASR-1.7B (vLLM) + Qwen3-ForcedAligner-0.6B.
+Chép lời video HLS (kết quả khớp `ml.VideoTranscript` bản v2 của moon-ml), tệp upload hoặc link tệp tiếng/video.
+Từ 31/10/2026 mọi chỗ cần nhận dạng giọng chỉ gọi server này, không tự nạp mô hình:
+
+| Ai gọi | Chế độ | Đầu vào |
+|---|---|---|
+| moon-ml `video_transcript` | `cues` | link HLS |
+| ai-video-skills `speech_check.py` (Xưởng video, cả trong sandbox OpenShell) | `text`, `language: Vietnamese` | upload wav |
+| ai-video-skills `align_words.py` (mốc từng chữ phụ đề) | `align` | upload wav + chữ TTS đọc |
+| tiktok-phan-tich-video `chep_loi.py` | `cues` | upload mp4 |
+
+Client stdlib dùng chung: `ai-video-skills/skills/video-core/kit/scripts/asr_client.py`.
+
+Máy chính (192.168.4.63): user unit `~/.config/systemd/user/qwen3-asr-local.service`, nghe `127.0.0.1:8020` và
+`172.17.0.1:8020` (docker0, cho sandbox), `ASR_GPU_UTIL=0.085` cạnh vLLM Qwen 27B. Bản ở máy khác (21–31/10/2026):
+https://asr.daoan.online, unit `deploy/qwen3-asr.service`.
 
 ## Cài
 
@@ -32,7 +45,8 @@ Strata không chạy cùng lúc được.
 
 Mọi endpoint trừ `/health` cần key.
 Gửi key qua `Authorization: Bearer <key>` hoặc `X-API-Key: <key>`.
-Key nằm trong `.api_key`.
+Key chính nằm trong `.api_key` (tên `main`, không giới hạn).
+Khoá phụ ở `.api_keys`, mỗi dòng `tên khoá` (vd. `studio` cho Xưởng video); mỗi khoá phụ tối đa `ASR_KEY_MAX_QUEUE` job chờ.
 
 Cloudflare chặn User-Agent `Python-urllib`.
 Client dùng urllib phải tự đặt header `User-Agent`.
@@ -40,8 +54,9 @@ Client dùng urllib phải tự đặt header `User-Agent`.
 | Endpoint | Việc |
 |---|---|
 | `GET /health` | `{"status","queue","running","model","version"}` |
+| `POST /v1/uploads` | Thân request là nguyên tệp (wav, mp3, mp4…) → `{upload_id, bytes}`; giữ 24 h từ lần dùng cuối |
 | `POST /v1/asr/jobs` | Tạo job, trả `202` |
-| `GET /v1/asr/jobs/{id}` | Trạng thái và kết quả |
+| `GET /v1/asr/jobs/{id}?wait=30` | Trạng thái và kết quả; `wait` giữ request tới khi xong (≤ 60 s) |
 | `DELETE /v1/asr/jobs/{id}` | Huỷ job |
 | `GET /v1/asr/jobs/{id}/result.vtt` | Phụ đề VTT |
 
@@ -51,6 +66,15 @@ curl https://asr.daoan.online/v1/asr/jobs \
   -H "Content-Type: application/json" \
   -d '{"audio_url":"https://lessonvid.khaothi.ai/2026/10/1181195/master.m3u8","ref":"1181195","max_seconds":7200}'
 ```
+
+Job: đúng một trong `audio_url` / `upload_id`; `mode`:
+- `cues` (mặc định): câu phụ đề `{s,e,t,lang}` + `vtt`, thuật toán v2 hai lượt, khoá ngôn ngữ Việt/Anh.
+- `text`: chỉ `text`, khúc ~20 s nối lại. `language` (vd. `Vietnamese`) ép ngôn ngữ như `qwen_asr transcribe(language=…)`.
+- `align`: cần `text`; trả `words` `[[từ, bắt đầu, kết thúc], …]` (tiếng ≤ 180 s). Tệp upload để qwen_asr tự đọc:
+  mốc giống hệt `align_words.py` local cũ (đo 31/10/2026 trên 3 đoạn TTS).
+
+`audio_url` đuôi `.m3u8`/`.ts` đi thẳng HLS như trước. Link khác: tải về, nội dung `#EXTM3U` → HLS, trang web →
+`failed not_media`, còn lại giải mã bằng PyAV.
 
 Hành vi chính:
 - `priority`: `high`, `normal` hoặc `low`. Job `high` được thêm 4 slot chạy riêng.
@@ -67,7 +91,10 @@ Hành vi chính:
   `hls.py` chỉ thêm phần tải trước, thử lại và báo tiến độ. Wav ra không đổi.
 - `asrserver/langlock.py`: khoá token ngay sau `language`. Chỉ cho Vietnamese, English, None.
 - `asrserver/engine.py`: gọi vLLM AsyncLLM. Mỗi khúc là một request, khúc của mọi job dùng chung batch.
-- `asrserver/app.py`: API, hàng đợi, lưu job.
+- `asrserver/app.py`: API, hàng đợi, lưu job, upload, chế độ text/align, nhiều khoá.
+- `asrserver/media.py`: tệp upload / link tệp tiếng-video → tiếng 16 kHz (PyAV).
+- `asrserver/aligner.py`: Qwen3-ForcedAligner-0.6B trong tiến trình API (~1,5 GB VRAM), một yêu cầu một lúc.
+- `tests/test_app.py`: test API với engine/aligner giả (`.venv/bin/python -m pytest -q tests`).
 - `asrserver/edge_dns.py`: chọn edge CDN qua DNS khác. Tắt mặc định.
 - `tools/try_jobs.py`, `tools/load_test.py`: gửi job thử và thử tải.
 
@@ -75,7 +102,11 @@ Hành vi chính:
 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
+| `ASR_HOST` | `127.0.0.1` | Một hoặc nhiều địa chỉ, cách nhau dấu phẩy (vd. `127.0.0.1,172.17.0.1`) |
 | `ASR_GPU_UTIL` | `0.45` | Phần VRAM vLLM giữ. Encoder dùng thêm khoảng 3 GB ngoài phần này. |
+| `ASR_ALIGN_DEVICE` | `cuda:0` | Thiết bị của ForcedAligner; `ASR_ALIGN_PRELOAD=0` thì nạp lúc job align đầu tiên |
+| `ASR_MAX_UPLOAD_MB` | `512` | Cỡ tối đa một tệp upload / tệp tải từ link |
+| `ASR_KEY_MAX_QUEUE` | `200` | Job chờ tối đa của mỗi khoá phụ |
 | `ASR_MAX_ACTIVE` | `12` | Số job tải và chép cùng lúc. 6 thì mạng còn trống. |
 | `ASR_HIGH_EXTRA` | `4` | Slot thêm cho job `high` |
 | `ASR_MAX_QUEUE` | `2000` | Quá số này thì trả `429` |

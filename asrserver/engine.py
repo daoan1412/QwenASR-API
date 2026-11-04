@@ -43,6 +43,7 @@ class Engine:
             scheduling_policy="priority",
             logits_processors=[LangLock] if lang_lock else None,
             limit_mm_per_prompt={"audio": 1},
+            mm_processor_cache_gb=0,          # khúc audio không lặp lại → bộ đệm LRU mặc định 4 GB chỉ tốn RAM
             attention_backend="FLASH_ATTN",   # bắt buộc cho VLLM_BATCH_INVARIANT
         ))
 
@@ -56,17 +57,22 @@ class Engine:
             ids.append(t[0])
         return ids
 
-    async def one(self, wav, lang_ids, tokens_per_second=15.0, priority=1):
+    async def one(self, wav, lang_ids, tokens_per_second=15.0, priority=1, force_language=None):
+        """force_language ("Vietnamese"): như qwen_asr transcribe(language=…) — prompt kết thúc bằng "language X<asr_text>",
+        mô hình chỉ viết chữ (lời tiếng khác bị dịch sang X). Không ép thì khoá ngôn ngữ theo lang_ids."""
         sp = SamplingParams(
             temperature=0.0,
             max_tokens=int(tokens_per_second * len(wav) / SR + 32),
             output_kind=RequestOutputKind.FINAL_ONLY,
-            extra_args={"allowed_lang_ids": lang_ids} if self.lang_lock else None,
+            extra_args={"allowed_lang_ids": lang_ids} if self.lang_lock and not force_language else None,
         )
+        prompt = self.prompt + f"language {force_language}<asr_text>" if force_language else self.prompt
         final = None
-        async for out in self.llm.generate({"prompt": self.prompt, "multi_modal_data": {"audio": [wav]}},
+        async for out in self.llm.generate({"prompt": prompt, "multi_modal_data": {"audio": [wav]}},
                                            sp, uuid.uuid4().hex, priority=priority):
             final = out
+        if force_language:
+            return force_language, final.outputs[0].text.strip()
         return parse(final.outputs[0].text)
 
     async def warmup(self):
