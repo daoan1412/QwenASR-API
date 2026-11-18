@@ -97,6 +97,8 @@ class Options(BaseModel):
     max_chars: int = Field(84, gt=0)
     line_chars: int = Field(42, gt=0)
     tokens_per_second: float = Field(15.0, gt=0)
+    words: bool = False              # cues: thêm `words` [[từ, s, e], …] — mốc từng từ bằng ForcedAligner (aligner.align_cues)
+    align_chunk_s: float = Field(0.0, ge=0, le=170)   # words / align+cues: gom câu thành khúc ≤ bấy nhiêu giây; 0 = mỗi câu một khúc
 
 
 class JobIn(BaseModel):
@@ -105,6 +107,8 @@ class JobIn(BaseModel):
     upload_id: str | None = None     # tệp đã gửi qua POST /v1/uploads
     mode: Literal["cues", "text", "align"] = "cues"
     text: str | None = None          # align: lời đã biết (vd. chữ TTS đọc)
+    cues: list[dict] | None = None   # align: câu phụ đề đã chép [{s, e, t, lang}] (vd. ml.VideoTranscript) — gán mốc từng từ
+                                     #   cho lời có sẵn mà không chép lại; tiếng dài bao nhiêu cũng được (chia khúc ≤ 150 s)
     language: str | None = None      # text: ép ngôn ngữ (như qwen_asr language=…); align: mặc định Vietnamese
     ref: str | int | None = None
     max_seconds: float = Field(0, ge=0)
@@ -118,8 +122,10 @@ class JobIn(BaseModel):
             raise ValueError("cần đúng một trong audio_url / upload_id")
         if self.upload_id is not None and not UPLOAD_ID.fullmatch(self.upload_id):
             raise ValueError("upload_id sai dạng")
-        if self.mode == "align" and not (self.text or "").strip():
-            raise ValueError("mode align cần text")
+        if self.mode == "align" and not (self.text or "").strip() and not self.cues:
+            raise ValueError("mode align cần text hoặc cues")
+        if self.cues is not None and (self.mode != "align" or (self.text or "").strip()):
+            raise ValueError("cues chỉ dùng với mode align, không kèm text")
         return self
 
 
@@ -154,7 +160,7 @@ def classify(e):
 
 # ---------- JOB ----------
 class Job:
-    FIELDS = ("job_id", "ref", "status", "audio_url", "upload_id", "mode", "text", "language", "key_name",
+    FIELDS = ("job_id", "ref", "status", "audio_url", "upload_id", "mode", "text", "cues", "language", "key_name",
               "max_seconds", "priority", "options", "callback_url",
               "idempotency_key", "seq", "created_at", "started_at", "finished_at", "expires_at",
               "result", "timing", "error")
@@ -250,7 +256,7 @@ class Server:
             os.utime(p)
         self.seq += 1
         job = Job(job_id=f"asr_{secrets.token_hex(8)}", ref=body.ref, status="queued", audio_url=body.audio_url,
-                  upload_id=body.upload_id, mode=body.mode, text=body.text, language=body.language, key_name=key_name,
+                  upload_id=body.upload_id, mode=body.mode, text=body.text, cues=body.cues, language=body.language, key_name=key_name,
                   max_seconds=body.max_seconds, priority=body.priority, options=body.options.model_dump(),
                   callback_url=body.callback_url, idempotency_key=key, seq=self.seq, created_at=iso(now()))
         job.save()
@@ -373,9 +379,18 @@ class Server:
                   "vtt": cues.to_vtt(out, cfg["line_chars"]) if out else None,
                   "model": MODEL, "version": VERSION}
         t2 = time.monotonic()
-        return result, {"download_sec": round(t1 - t0, 2), "asr_sec": round(t2 - t1, 2),
-                        "processing_sec": round(t2 - t0, 2),
-                        "rtf": round((t2 - t0) / audio.seconds, 4) if audio.seconds else None}
+        timing = {"download_sec": round(t1 - t0, 2), "asr_sec": round(t2 - t1, 2)}
+        if cfg.get("words") and out:
+            job.progress = {"stage": "align", "done": 0, "total": 1, "percent": 99}
+            try:
+                result["words"] = aligner.align_cues(ALIGNER, audio.wav, out, cfg.get("align_chunk_s", 0.0))
+            except Exception as e:  # mốc từng từ hỏng không làm hỏng câu phụ đề
+                log.warning("align từ hỏng %s: %r", job.job_id, e)
+                result["words"], result["words_error"] = None, f"{type(e).__name__}: {e}"[:300]
+            timing["align_sec"] = round(time.monotonic() - t2, 2)
+        t3 = time.monotonic()
+        return result, {**timing, "processing_sec": round(t3 - t0, 2),
+                        "rtf": round((t3 - t0) / audio.seconds, 4) if audio.seconds else None}
 
     def work_text(self, job, audio, cfg):
         """Chỉ chữ (vd. soát giọng TTS): một lượt khúc ~window_s giây cắt ở chỗ nhỏ tiếng, bỏ khúc lặng, nối chữ."""
@@ -402,6 +417,8 @@ class Server:
         if audio.wav is None:
             return {"status": "no_audio", "words": [], **base}
         job.progress = {"stage": "align", "done": 0, "total": 1, "percent": 50}
+        if job.cues:
+            return {"status": "ok", "words": aligner.align_cues(ALIGNER, audio.wav, job.cues, job.options.get("align_chunk_s", 0.0)), **base}
         path = str(UPLOADS / job.upload_id) if job.upload_id else None
         return {"status": "ok", "words": ALIGNER.align(audio.wav, job.text, job.language or "Vietnamese", path), **base}
 

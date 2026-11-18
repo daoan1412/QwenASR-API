@@ -54,7 +54,7 @@ class FakeEngine:
 
 class FakeAligner:
     def align(self, wav, text, language, path=None):
-        assert path and os.path.exists(path)
+        assert path is None or os.path.exists(path)   # upload: đường dẫn tệp; align_cues: khúc wav
         return [[w, i * 0.5, i * 0.5 + 0.4] for i, w in enumerate(text.split())]
 
 
@@ -199,3 +199,42 @@ def test_decode_mp4_and_no_audio(tmp_path):
     a = media.decode(str(mp4))
     assert a.wav is not None and abs(a.seconds - 2.0) < 0.1
     assert media.decode(str(silent)).wav is None
+
+
+def test_align_cues_chunks_and_offsets():
+    """align_cues: câu gom thành khúc ≤ chunk_s, mốc từ cộng đầu khúc (trừ đệm), ngôn ngữ theo số đông câu của khúc."""
+    from asrserver import aligner
+
+    seen = []
+
+    class Al:
+        def align(self, wav, text, language, path=None):
+            seen.append((round(len(wav) / SR, 1), text, language))
+            return [[w, i * 1.0, i * 1.0 + 0.5] for i, w in enumerate(text.split())]
+
+    cues = [{"s": 10.0, "e": 14.0, "t": "câu một", "lang": "vi"}, {"s": 15.0, "e": 19.0, "t": "câu hai", "lang": "vi"},
+            {"s": 200.0, "e": 204.0, "t": "hello there", "lang": "en"}]
+    words = aligner.align_cues(Al(), np.zeros(300 * SR, np.float32), cues, chunk_s=150)
+    assert [x[1:] for x in seen] == [("câu một câu hai", "Vietnamese"), ("hello there", "English")]
+    assert seen[0][0] == 9.6                                   # 9,7 → 19,3 (đệm 0,3 s)
+    assert words[0] == ["câu", 9.7, 10.2, 0] and words[-1] == ["there", 200.7, 201.2, 2]
+    assert [w[3] for w in words] == [0, 0, 1, 1, 2, 2]                     # khúc nhiều câu: chia theo số từ
+    one = aligner.align_cues(Al(), np.zeros(300 * SR, np.float32), cues)   # mặc định mỗi câu một khúc
+    assert [w[3] for w in one] == [0, 0, 1, 1, 2, 2] and len(seen) == 5
+
+
+def test_cues_mode_words_option(client):
+    uid = client.post("/v1/uploads", content=tone_wav(4.0), headers=H).json()["upload_id"]
+    res = run_job(client, {"upload_id": uid, "options": {"words": True}})["result"]
+    assert res["cues"] and res["words"] and all(len(w) == 4 for w in res["words"])
+    res = run_job(client, {"upload_id": uid})["result"]
+    assert "words" not in res
+
+
+def test_align_mode_with_cues(client):
+    uid = client.post("/v1/uploads", content=tone_wav(4.0), headers=H).json()["upload_id"]
+    cues = [{"s": 0.2, "e": 2.0, "t": "xin chào", "lang": "vi"}]
+    res = run_job(client, {"upload_id": uid, "mode": "align", "cues": cues})["result"]
+    assert res["status"] == "ok" and [w[0] for w in res["words"]] == ["xin", "chào"]
+    bad = client.post("/v1/asr/jobs", json={"upload_id": uid, "cues": cues}, headers=H)   # cues mà không phải align
+    assert bad.status_code == 400

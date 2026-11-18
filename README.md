@@ -72,6 +72,12 @@ Job: đúng một trong `audio_url` / `upload_id`; `mode`:
 - `text`: chỉ `text`, khúc ~20 s nối lại. `language` (vd. `Vietnamese`) ép ngôn ngữ như `qwen_asr transcribe(language=…)`.
 - `align`: cần `text`; trả `words` `[[từ, bắt đầu, kết thúc], …]` (tiếng ≤ 180 s). Tệp upload để qwen_asr tự đọc:
   mốc giống hệt `align_words.py` local cũ (đo 31/10/2026 trên 3 đoạn TTS).
+  Hoặc `cues` `[{s, e, t, lang}]` thay `text` (10/11/2026): gán mốc từng từ cho lời ĐÃ CHÉP (vd. `ml.VideoTranscript`) mà
+  không chép lại — tiếng dài bao nhiêu cũng được; mặc định mỗi câu một khúc trong khung giờ của câu (`options.align_chunk_s`
+  0; khúc 150 s thì aligner trôi — 10% câu lệch > 26 s); `words` = `[[từ, s, e, câu], …]`, `câu` = chỉ số câu chứa từ
+  (aligner có thể tách từ khác khoảng trắng). Video 53 phút ~37 s.
+- `options.words: true` ở chế độ `cues`: chép xong thì gán mốc từng từ luôn, kết quả có thêm `words` `[[từ, s, e, câu], …]`
+  (mốc từ đầu video) và `timing.align_sec`; aligner hỏng thì `words: null` + `words_error`, câu phụ đề vẫn trả.
 
 `audio_url` đuôi `.m3u8`/`.ts` đi thẳng HLS như trước. Link khác: tải về, nội dung `#EXTM3U` → HLS, trang web →
 `failed not_media`, còn lại giải mã bằng PyAV.
